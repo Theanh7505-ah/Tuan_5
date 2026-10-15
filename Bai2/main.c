@@ -1,217 +1,78 @@
 /*
- * BAI 02 - STM32F103C8T6 + FreeRTOS + HAL
- * PB10 button (EXTI falling edge) -> xQueueSendFromISR -> UART1 task.
+ * Copyright (c) 2013-2021 ARM Limited. All rights reserved.
  *
- * Hardware: 8 MHz HSE (Blue Pill) -> 72 MHz SYSCLK.
- * Button: PB10 pulled up internally, switch PB10 to GND.
- * USART1_TX=PA9, USART1_RX=PA10, 115200 8N1.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * Use with CubeIDE/CubeMX-generated STM32F103C8Tx project:
- * - Enable FreeRTOS (CMSIS_V1, dynamic allocation, heap_4).
- * - Leave PB10 EXTI and USART1 unconfigured in CubeMX: initialized below.
- * - Replace Core/Src/main.c with this file.
- * - Generated stm32f1xx_it.c must not also define EXTI15_10_IRQHandler.
- * - Keep generated SysTick/FreeRTOS handlers.
- */
+ * Licensed under the Apache License, Version 2.0 (the License); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an AS IS BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * ----------------------------------------------------------------------
+ *
+ * $Date:        21. May 2021
+ * $Revision:    V2.0.0
+ *
+ * Project:      CMSIS-DAP Examples LPC-Link2
+ * Title:        main.c CMSIS-DAP Main module for LPC-Link2
+ *
+ *---------------------------------------------------------------------------*/
 
-#include "main.h"
-#include "FreeRTOS.h"
-#include "task.h"
-#include "queue.h"
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
+#include "cmsis_os2.h"
+#include "osObjects.h"
+#include "rl_usb.h"
+#include "DAP_config.h"
+#include "DAP.h"
 
-#define DEBOUNCE_MS   50U
-#define QUEUE_LENGTH  16U
+// Application Main program
+__NO_RETURN void app_main (void *argument) {
+  (void)argument;
 
-static UART_HandleTypeDef huart1;
-static QueueHandle_t count_queue = NULL;
-static volatile uint32_t button_count = 0U;
-static volatile uint32_t last_press_tick = 0U;
-static volatile uint8_t have_last_press = 0U;
+  DAP_Setup();                          // DAP Setup 
 
-static void SystemClock_Config(void);
-static void USART1_Init(void);
-static void Button_EXTI_Init(void);
-static void UART_Task(void *argument);
-void Error_Handler(void);
+  USBD_Initialize(0U);                  // USB Device Initialization
+#ifdef LPC_LINK2_ONBOARD
+  char *ser_num;
+  ser_num = GetSerialNum();
+  if (ser_num != NULL) {
+    USBD_SetSerialNumber(0U, ser_num);  // Update Serial Number
+  }
+#endif
+  USBD_Connect(0U);                     // USB Device Connect
 
-int main(void)
-{
-    HAL_Init();
-    SystemClock_Config();
-    USART1_Init();
-    Button_EXTI_Init();
+  while (!USBD_Configured(0U));         // Wait for USB Device to configure
 
-    count_queue = xQueueCreate(QUEUE_LENGTH, sizeof(uint32_t));
-    if (count_queue == NULL) {
-        Error_Handler();
-    }
+  LED_CONNECTED_OUT(1U);                // Turn on  Debugger Connected LED
+  LED_RUNNING_OUT(1U);                  // Turn on  Target Running LED
+  Delayms(500U);                        // Wait for 500ms
+  LED_RUNNING_OUT(0U);                  // Turn off Target Running LED
+  LED_CONNECTED_OUT(0U);                // Turn off Debugger Connected LED
 
-    if (xTaskCreate(UART_Task, "UART_Print", 256U, NULL,
-                    tskIDLE_PRIORITY + 2U, NULL) != pdPASS) {
-        Error_Handler();
-    }
+  // Create DAP Thread
+  DAP_ThreadId = osThreadNew(DAP_Thread, NULL, &DAP_ThreadAttr);
 
-    /* IRQ remains disabled until the scheduler runs and UART_Task starts. */
-    vTaskStartScheduler();
-    Error_Handler();
+  // Create SWO Thread
+  SWO_ThreadId = osThreadNew(SWO_Thread, NULL, &SWO_ThreadAttr);
+
+  osDelay(osWaitForever);
+  for (;;) {}
 }
 
-static void UART_Task(void *argument)
-{
-    (void)argument;
-    uint32_t received_count;
-    char message[64];
-    const char startup[] = "EXTI counter ready.\r\n";
+int main (void) {
 
-    /* Priority was configured in Button_EXTI_Init(). */
-    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+  SystemCoreClockUpdate();
+  osKernelInitialize();                 // Initialize CMSIS-RTOS
+  osThreadNew(app_main, NULL, NULL);    // Create application main thread
+  if (osKernelGetState() == osKernelReady) {
+    osKernelStart();                    // Start thread execution
+  }
 
-    (void)HAL_UART_Transmit(&huart1, (uint8_t *)startup,
-                            (uint16_t)(sizeof(startup) - 1U), 100U);
-
-    for (;;) {
-        /* Blocks indefinitely until ISR posts an element to the queue. */
-        if (xQueueReceive(count_queue, &received_count, portMAX_DELAY) == pdTRUE) {
-            int len = snprintf(message, sizeof(message),
-                               "So lan nhan nut: %lu\r\n",
-                               (unsigned long)received_count);
-            if (len > 0 && (size_t)len < sizeof(message)) {
-                (void)HAL_UART_Transmit(&huart1, (uint8_t *)message,
-                                        (uint16_t)len, 100U);
-            }
-        }
-    }
-}
-
-/* This IRQ handler must be defined exactly once in the project. */
-void EXTI15_10_IRQHandler(void)
-{
-    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_10);
-}
-
-/* Called by HAL_GPIO_EXTI_IRQHandler() from interrupt context. */
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    if (GPIO_Pin != GPIO_PIN_10 || count_queue == NULL) {
-        return;
-    }
-
-    uint32_t now = HAL_GetTick();
-    if (have_last_press != 0U &&
-        (uint32_t)(now - last_press_tick) < DEBOUNCE_MS) {
-        return;  /* Ignore bounce edges occurring within 50 ms. */
-    }
-    last_press_tick = now;
-    have_last_press = 1U;
-
-    uint32_t new_count = ++button_count;
-    BaseType_t higher_priority_task_woken = pdFALSE;
-
-    /* Required API: send data safely from EXTI interrupt context. */
-    (void)xQueueSendFromISR(count_queue, &new_count,
-                             &higher_priority_task_woken);
-
-    /* Required API: switch immediately if an awakened task has priority. */
-    portYIELD_FROM_ISR(higher_priority_task_woken);
-}
-
-static void USART1_Init(void)
-{
-    GPIO_InitTypeDef gpio = {0};
-
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_USART1_CLK_ENABLE();
-    __HAL_RCC_AFIO_CLK_ENABLE();
-
-    gpio.Pin = GPIO_PIN_9;
-    gpio.Mode = GPIO_MODE_AF_PP;
-    gpio.Pull = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOA, &gpio);
-
-    gpio.Pin = GPIO_PIN_10;
-    gpio.Mode = GPIO_MODE_INPUT;
-    gpio.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(GPIOA, &gpio);
-
-    huart1.Instance = USART1;
-    huart1.Init.BaudRate = 115200U;
-    huart1.Init.WordLength = UART_WORDLENGTH_8B;
-    huart1.Init.StopBits = UART_STOPBITS_1;
-    huart1.Init.Parity = UART_PARITY_NONE;
-    huart1.Init.Mode = UART_MODE_TX_RX;
-    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-    if (HAL_UART_Init(&huart1) != HAL_OK) {
-        Error_Handler();
-    }
-}
-
-static void Button_EXTI_Init(void)
-{
-    GPIO_InitTypeDef gpio = {0};
-
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    __HAL_RCC_AFIO_CLK_ENABLE();
-
-    gpio.Pin = GPIO_PIN_10;
-    gpio.Mode = GPIO_MODE_IT_FALLING;
-    gpio.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(GPIOB, &gpio);
-
-    /* Cortex-M3 STM32F1 uses 4 preemption priority bits by default.
-     * 5 is FreeRTOS-safe when configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY=5.
-     */
-    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5U, 0U);
-    /* Enable IRQ later from UART_Task, after scheduler has started. */
-}
-
-static void SystemClock_Config(void)
-{
-    RCC_OscInitTypeDef osc = {0};
-    RCC_ClkInitTypeDef clk = {0};
-
-    osc.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    osc.HSEState = RCC_HSE_ON;
-    osc.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
-    osc.PLL.PLLState = RCC_PLL_ON;
-    osc.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-    osc.PLL.PLLMUL = RCC_PLL_MUL9;
-    if (HAL_RCC_OscConfig(&osc) != HAL_OK) {
-        Error_Handler();
-    }
-
-    clk.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-                    RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
-    clk.APB1CLKDivider = RCC_HCLK_DIV2;
-    clk.APB2CLKDivider = RCC_HCLK_DIV1;
-    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) != HAL_OK) {
-        Error_Handler();
-    }
-}
-
-void Error_Handler(void)
-{
-    __disable_irq();
-    for (;;) {
-    }
-}
-
-/* FreeRTOS stack overflow hook */
-void vApplicationStackOverflowHook(TaskHandle_t xTask,
-                                   char *pcTaskName)
-{
-    (void)xTask;
-    (void)pcTaskName;
-
-    taskDISABLE_INTERRUPTS();
-
-    while (1)
-    {
-        /* Stack overflow detected */
-    }
+  for (;;) {}
 }
